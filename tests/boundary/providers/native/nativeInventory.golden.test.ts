@@ -9,6 +9,7 @@ import {
 } from "../../../../src/artifacts/apple/MachoImage.fixture.js";
 import { err, ok } from "../../../../src/domain/result.js";
 import { parseExecutableHeader } from "../../../../src/domain/binaryTarget.js";
+import { readFatContainerHeader } from "../../../../src/domain/apple/machoContainer.js";
 import {
   NativeCommandFailure,
   type NativeCommandCapture,
@@ -59,6 +60,46 @@ const thinLipo =
   "input file fixture is not a fat file\nNon-fat file: fixture is architecture: arm64\n";
 const inventoryRunner = (outputs: Readonly<Record<string, string>> = {}) =>
   new FixtureRunner({ lipo: thinLipo, ...outputs });
+
+/** Supply an explicit selection to signature tests, independently of admission.
+ * Provider-neutral admission intentionally refuses several slices of one family.
+ */
+const explicitlySelectedSignatureHeader = async (path: string) => {
+  const bytes = await readFile(path);
+  const container = readFatContainerHeader(bytes, bytes.length);
+  if (container.state !== "parsed") throw new Error("expected FAT fixture");
+  const slices = container.slices.map((slice) => {
+    const thin = parseExecutableHeader(
+      bytes.subarray(slice.offset, slice.offset + slice.size),
+      "arm64",
+    );
+    if (!thin.ok || thin.value.format !== "mach-o")
+      throw new Error("expected thin Mach-O fixture");
+    return { slice, metadata: thin.value };
+  });
+  const selected = slices[0];
+  if (selected === undefined)
+    throw new Error("expected selected fixture slice");
+  return {
+    ...selected.metadata,
+    format: "mach-o-universal" as const,
+    availableArchitectures: [
+      ...new Set(slices.map(({ metadata }) => metadata.architecture)),
+    ],
+    universalSlice: {
+      offset: selected.slice.offset,
+      size: selected.slice.size,
+    },
+    universalSlices: container.slices.map(
+      ({ offset, size, cpuType, cpuSubtype }) => ({
+        offset,
+        size,
+        cpuType,
+        cpuSubtype,
+      }),
+    ),
+  };
+};
 
 const signatureTarget = async (
   signedArchitecture: "arm64" | "arm64e" = "arm64",
@@ -227,9 +268,7 @@ it("retains distinct same-family FAT slices for signature coverage", async () =>
       })),
     ),
   );
-  const header = parseExecutableHeader(await readFile(path), "arm64");
-  if (!header.ok || header.value.format !== "mach-o-universal")
-    throw new Error("expected universal fixture");
+  const header = await explicitlySelectedSignatureHeader(path);
   const replay = signatureRunner({
     signed: (await fixture("codesign.txt")).replace(
       /^Format=.*$/mu,
@@ -251,7 +290,7 @@ it("retains distinct same-family FAT slices for signature coverage", async () =>
   };
   const client = new NativeMacOSProvider({}, runner, "darwin").createClient({
     ...(await nativeMachoTargetForFile(path)),
-    ...header.value,
+    ...header,
   });
   const execution = await client.execute("inspect_signature", {});
   if (!execution.ok) throw execution.error;
@@ -288,9 +327,7 @@ it.each([42, 0xc1000002])(
         })),
       ),
     );
-    const header = parseExecutableHeader(await readFile(path), "arm64");
-    if (!header.ok || header.value.format !== "mach-o-universal")
-      throw new Error("expected universal fixture");
+    const header = await explicitlySelectedSignatureHeader(path);
     const client = new NativeMacOSProvider(
       {},
       signatureRunner({
@@ -301,7 +338,7 @@ it.each([42, 0xc1000002])(
       "darwin",
     ).createClient({
       ...(await nativeMachoTargetForFile(path)),
-      ...header.value,
+      ...header,
     });
     const execution = await client.execute("inspect_signature", {});
     if (!execution.ok) throw execution.error;
@@ -332,13 +369,11 @@ it.each([
       path,
       fatImage(cpus.map((cpu) => ({ cpu, bytes: machoImage({ cpu }) }))),
     );
-    const header = parseExecutableHeader(await readFile(path), "arm64");
-    if (!header.ok || header.value.format !== "mach-o-universal")
-      throw new Error("expected universal fixture");
-    // Admission selects the first slice; codesign resolves -a arm64e to the
+    const header = await explicitlySelectedSignatureHeader(path);
+    // This fixture selects the first slice; codesign resolves -a arm64e to the
     // first arm64e slice in table order, whatever its ABI version.
-    expect(header.value.universalSlice.offset).toBe(
-      header.value.universalSlices[0]?.offset,
+    expect(header.universalSlice.offset).toBe(
+      header.universalSlices[0]?.offset,
     );
     const replay = signatureRunner({
       signed: await fixture("codesign.txt"),
@@ -355,7 +390,7 @@ it.each([
     };
     const client = new NativeMacOSProvider({}, runner, "darwin").createClient({
       ...(await nativeMachoTargetForFile(path)),
-      ...header.value,
+      ...header,
     });
     const result = await client.execute("inspect_signature", {});
     if (!result.ok) throw result.error;
