@@ -11,7 +11,6 @@ import {
 import { parseEvidence } from "../../../src/domain/evidence.js";
 import { compareWebCaptures } from "../../../src/domain/webCaptureDiff.js";
 import { compareWebCapturesInputSchema } from "../../../src/domain/webCaptureDiffSchemas.js";
-import { webResourceComparisonIdentity } from "../../../src/domain/webInventory.js";
 import { startFakeCdpBrowser } from "../../fixtures/fakeCdpBrowser.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -235,7 +234,7 @@ describe("resource inventory omissions through CDP", () => {
     "child-invalid-entry",
     "child-wrong-type",
   ] as const)(
-    "retains proven changes without inferring omissions or equality for %s",
+    "does not claim a resource removal or equality for %s",
     async (mode) => {
       const { state, inspect, origin } = await startBrowser();
       const before = await inspect();
@@ -245,31 +244,16 @@ describe("resource inventory omissions through CDP", () => {
       );
       state.mode = mode;
       const after = await inspect();
-      for (const [left, right, direction] of [
-        [before, after, "added"],
-        [after, before, "removed"],
-        [after, after, null],
-      ] as const) {
-        // A retained child resource absent from the complete peer is a proven
-        // change. Missing rows in the partial inventory still prove nothing.
-        const child = after.resources.find(({ url }) =>
-          url.endsWith("/child.js"),
-        );
-        const changes =
-          child !== undefined && direction !== null
-            ? [
-                {
-                  identity: webResourceComparisonIdentity(child),
-                  change: direction,
-                },
-              ]
-            : [];
+      for (const [left, right] of [
+        [before, after],
+        [after, before],
+        [after, after],
+      ] as const)
         expect(compareResources(left, right)).toMatchObject({
-          status: changes.length ? "changed" : "unknown",
-          total_changes: changes.length,
-          changes,
+          status: "unknown",
+          total_changes: 0,
+          changes: [],
         });
-      }
       expect(after.completeness.unavailable_sections).toContain("resources");
       expect(after.completeness.excluded).toContainEqual({
         section: "resources",

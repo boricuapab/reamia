@@ -61,9 +61,7 @@ const thinLipo =
 const inventoryRunner = (outputs: Readonly<Record<string, string>> = {}) =>
   new FixtureRunner({ lipo: thinLipo, ...outputs });
 
-/** Supply an explicit selection to signature tests, independently of admission.
- * Provider-neutral admission intentionally refuses several slices of one family.
- */
+/** Supply an explicit slice selection to signature tests, independently of admission. */
 const explicitlySelectedSignatureHeader = async (path: string) => {
   const bytes = await readFile(path);
   const container = readFatContainerHeader(bytes, bytes.length);

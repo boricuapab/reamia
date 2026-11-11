@@ -119,8 +119,8 @@ it("compares encrypted Godot PCK members by their declared MD5", async () => {
       dimensions: ["availability"],
     },
   ]);
-  // An all-zero MD5 is no claim, and one claim alone proves no change.
-  // md5_status repeats that occurrence fact, not an independent metadata change.
+  // An all-zero MD5 is not a declared claim. The one-sided claim is the
+  // metadata difference; the reader's note is not compared.
   const unclaimed = await inspect("unclaimed.pck", {
     path: "res://scenes/main.gd",
     data: "ciphertext D",
@@ -135,7 +135,7 @@ it("compares encrypted Godot PCK members by their declared MD5", async () => {
     {
       logical_path: "scenes/main.gd",
       classification: "unknown",
-      dimensions: ["availability"],
+      dimensions: ["metadata", "availability"],
     },
   ]);
   // Claims that differ declare different content, but REA cannot verify
