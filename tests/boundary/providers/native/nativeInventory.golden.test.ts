@@ -73,7 +73,11 @@ const explicitlySelectedSignatureHeader = async (path: string) => {
       bytes.subarray(slice.offset, slice.offset + slice.size),
       "arm64",
     );
-    if (!thin.ok || thin.value.format !== "mach-o")
+    if (
+      !thin.ok ||
+      thin.value.format !== "mach-o" ||
+      thin.value.architecture === "arm64_32"
+    )
       throw new Error("expected thin Mach-O fixture");
     return { slice, metadata: thin.value };
   });
