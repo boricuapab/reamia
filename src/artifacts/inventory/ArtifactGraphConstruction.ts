@@ -2,9 +2,16 @@ import { artifactFormatDescriptor } from "../artifactFormats.js";
 import { hasGodotPckHeader } from "../../domain/godotPckFormat.js";
 import { hasUImageMagic } from "../../domain/uimageFormat.js";
 import { hasUnityFsHeader } from "../../domain/unityfsFormat.js";
+import {
+  hasWxapkgEncryptedMagic,
+  hasWxapkgHeader,
+} from "../../domain/wxapkgFormat.js";
 import { detectHexRecordEncoding } from "../../domain/firmware/hexRecords.js";
 import { recognizeEspImage } from "../../domain/firmware/espImage.js";
+import { hasUf2Block } from "../../domain/firmware/uf2.js";
+import { isDfuSeFile } from "../../domain/firmware/dfuse.js";
 import { hasFitImagesNode } from "../../domain/firmware/fitImage.js";
+import { hasMftFileRecordHeader } from "../../domain/windows/ntfsMft.js";
 import type { ArtifactClassificationEvidence } from "../ArtifactClassificationProbe.js";
 import { asarHeaderAdmissionFailure } from "../AsarHeader.js";
 import { hasDestinationPath } from "../ArtifactPaths.js";
@@ -21,7 +28,11 @@ import {
   occurrenceIdForLocation,
   logicalPathNfc,
 } from "../../domain/artifactIdentity.js";
-import type { ArtifactEntry, ArtifactReader } from "../ArtifactReader.js";
+import type {
+  ArtifactEntry,
+  ArtifactReader,
+  ArtifactReaderTraversal,
+} from "../ArtifactReader.js";
 import type {
   ArtifactCommand,
   ArtifactEdge,
@@ -39,12 +50,19 @@ import {
   readFatContainerHeader,
   readMachoHeaderPrefixFacts,
 } from "../../domain/apple/machoContainer.js";
+import {
+  nesContainerFormat,
+  parseInesLayout,
+} from "../../domain/inesContainer.js";
 
 /** Mutable internal occurrence used until root-bound IDs are known. */
 export interface MutableOccurrence {
   occurrence_id: string;
   artifact_id: string | null;
   parent_occurrence_id: string | null;
+  relationship_coverage?: NonNullable<
+    ArtifactOccurrence["relationship_coverage"]
+  >;
   logical_path: string;
   entry_kind: ArtifactOccurrence["entry_kind"];
   artifact_kind: ArtifactOccurrence["artifact_kind"];
@@ -290,7 +308,8 @@ export const rootOccurrenceFor = (
   executable: metadata.executable,
   encrypted:
     (metadata.formatMetadata?.kind === "godot-pck" ||
-      metadata.formatMetadata?.kind === "unityfs") &&
+      metadata.formatMetadata?.kind === "unityfs" ||
+      metadata.formatMetadata?.kind === "wxapkg") &&
     metadata.formatMetadata.directory_status === "encrypted",
   hash_status: "verified",
   source_location: null,
@@ -332,6 +351,7 @@ export const rekeyOccurrences = (
 export const createArtifactEdges = (
   rootArtifactId: string,
   occurrences: MutableOccurrence[],
+  traversalStatus: ArtifactReaderTraversal["status"],
   producer?: ArtifactCommand,
 ): { readonly edges: ArtifactEdge[]; readonly limitations: string[] } => {
   const byId = new Map(occurrences.map((item) => [item.occurrence_id, item]));
@@ -339,12 +359,17 @@ export const createArtifactEdges = (
   const edges: ArtifactEdge[] = [];
   const limitations: string[] = [];
   for (const occurrence of occurrences) {
+    let relationshipComplete =
+      occurrence.logical_path === "." ||
+      (occurrence.parent_occurrence_id !== null &&
+        occurrence.artifact_id !== null);
     // Use the occurrence's own classification: a directory named `x.map` is
     // a container, not a source map of its sibling.
     const isSourceMap = occurrence.artifact_kind === "source-map";
-    const sourcePath = isSourceMap
-      ? occurrence.logical_path.slice(0, -".map".length)
-      : undefined;
+    const sourcePath =
+      isSourceMap && occurrence.logical_path !== "."
+        ? occurrence.logical_path.slice(0, -".map".length)
+        : undefined;
     const sourceCandidates =
       sourcePath === undefined ? [] : (byPath.get(sourcePath) ?? []);
     const mappedSource =
@@ -369,10 +394,15 @@ export const createArtifactEdges = (
               }
             : undefined;
       if (unknownMapping !== undefined) {
+        relationshipComplete = false;
         occurrence.limitations.push(unknownMapping.occurrence);
         limitations.push(unknownMapping.coverage);
       }
+      if (traversalStatus === "unknown") relationshipComplete = false;
     }
+    occurrence.relationship_coverage = relationshipComplete
+      ? "complete"
+      : "unknown";
     if (
       occurrence.parent_occurrence_id === null ||
       occurrence.artifact_id === null
@@ -412,15 +442,17 @@ interface ArtifactParentIndex {
   occurrences?: readonly MutableOccurrence[];
 }
 
+export interface ArtifactParentResolution {
+  readonly limitations: readonly string[];
+  readonly unknownParentOccurrences: ReadonlySet<MutableOccurrence>;
+}
+
 /** Resolve strict observed ancestors without rebuilding every path prefix. */
 export const resolveOccurrenceParents = (
   occurrences: readonly MutableOccurrence[],
   byPath: ReadonlyMap<string, readonly MutableOccurrence[]>,
   expandedContainerIds: ReadonlySet<string>,
-): {
-  readonly limitations: readonly string[];
-  readonly unknownParentOccurrences: ReadonlySet<MutableOccurrence>;
-} => {
+): ArtifactParentResolution => {
   const root: ArtifactParentIndex = { children: new Map() };
   for (const matches of byPath.values()) {
     const parents = matches.filter(
@@ -551,7 +583,10 @@ export const classifyArtifactContent = (
     asarHeader.state !== "rejected"
   ) {
     if (asarHeader.state === "limit")
-      throw asarHeaderAdmissionFailure(asarHeader.admission);
+      throw asarHeaderAdmissionFailure(
+        asarHeader.admission,
+        asarHeader.extents?.headerBytes,
+      );
     if (asarHeader.state === "matched")
       role = { kind: "container", format: "asar" };
     else role = artifactRoleForFormat(path, contentFormat);
@@ -587,15 +622,28 @@ export const classifyArtifactBytes = (
   evidence: ArtifactClassificationEvidence,
   fileSize = evidence.prefix.length,
 ): ArtifactNode["format"] => {
-  const { prefix, mzWindowsHeaderSignature } = evidence;
+  const { prefix, suffix, mzWindowsHeaderSignature } = evidence;
+  // A header-only region has the signature but not the declared cartridge
+  // extent. Keep it as a file instead of inventing another container.
+  if (
+    nesContainerFormat(prefix) === "ines" &&
+    parseInesLayout(prefix, fileSize).ok
+  )
+    return "ines";
   if (hasZipSignature(prefix)) return "zip";
   if (hasGodotPckHeader(prefix)) return "godot-pck";
   if (hasUnityFsHeader(prefix)) return "unityfs";
+  if (hasWxapkgEncryptedMagic(prefix) || hasWxapkgHeader(prefix))
+    return "wxapkg";
   if (hasUImageMagic(prefix)) return "uimage";
   const hexRecords = detectHexRecordEncoding(prefix);
   if (hexRecords !== undefined) return hexRecords;
+  if (hasUf2Block(prefix)) return "uf2";
+  if (suffix !== undefined && isDfuSeFile(prefix, suffix, fileSize))
+    return "dfuse";
   if (recognizeEspImage(prefix, fileSize) === "esp-image") return "esp-image";
   if (hasFitImagesNode(prefix)) return "fit";
+  if (hasMftFileRecordHeader(prefix)) return "ntfs-mft";
   if (hasBinaryPlistSignature(prefix)) return "plist";
   if (hasXmlPlistSignature(prefix)) return "plist";
   const fatFormat = classifyFatArtifact(evidence, fileSize);

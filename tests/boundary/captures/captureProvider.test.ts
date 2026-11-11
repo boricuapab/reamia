@@ -16,6 +16,7 @@ import { Cli } from "incur";
 import { registerCaptureCommands } from "../../../src/cli/captureCommands.js";
 import { silentLogger } from "../../../src/logger.js";
 import { analysisErrorRemediationAction } from "../../../src/domain/analysisErrorPresentation.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
 
 // A command-boundary simulator: real process ownership/filesystem, not real TShark coverage.
 const fixture = async (mode = "ok", failCleanup = false) => {
@@ -141,6 +142,63 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
   };
 };
 
+it("recovers the same capture with CLI producer budgets and retains a tighter inherited file limit", async () => {
+  const f = await fixture();
+  const refused = await f.service.inspect({
+    path: f.path,
+    fields: ["ip.addr"],
+    producer_limits: { input_bytes: 13 },
+  });
+  expect(refused).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisResourceConstraintError" },
+  });
+  if (refused.ok) throw new Error("Expected input-budget refusal");
+  expect(analysisErrorRemediationAction(refused.error)).toContain(
+    "producer_limits.input_bytes",
+  );
+  const cli = Cli.create("capture-producer-budget", { sync: false });
+  registerCaptureCommands(cli, silentLogger, {}, f.service);
+  let stdout = "";
+  await cli.serve(
+    [
+      "inspect-packet-capture",
+      f.path,
+      "--fields",
+      "ip.addr",
+      "--producer-limits",
+      JSON.stringify({
+        input_bytes: 15,
+        output_bytes: 1024,
+        command_timeout_ms: 1000,
+        address_space_bytes: 2147483648,
+        file_bytes: 2097152,
+        cpu_seconds: 45,
+      }),
+      "--format",
+      "json",
+    ],
+    {
+      stdout: (text) => {
+        stdout += text;
+      },
+      exit: () => {},
+    },
+  );
+  const evidence = parseEvidence(JSON.parse(stdout));
+  const report = packetCaptureSchema.parse(evidence.normalized_result);
+  expect(report.packets).toHaveLength(1);
+  expect(report.limits).toEqual({
+    input_bytes: 15,
+    output_bytes: 1024,
+    command_timeout_ms: 1000,
+    address_space_bytes: 2147483648,
+    file_bytes: 1048576,
+    cpu_seconds: 45,
+  });
+  expect(report.resource_limiter.arguments).toContain("--cpu=45:45");
+});
+
 it("refuses new acquisition after provider shutdown", async () => {
   const f = await fixture();
   await f.service.close();
@@ -189,6 +247,26 @@ it("preserves TShark canonical output for a caller-selected field alias", async 
   expect(report.tool.arguments).toContain("bootp.type");
 });
 
+it("refuses producer frames outside the selected input read scope before paging", async () => {
+  const f = await fixture("many");
+  const request = { path: f.path, fields: ["ip.addr"], match_limit: 1 };
+  expect(
+    await f.service.inspect({ ...request, packet_limit: 10 }),
+  ).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisOutputError", operation: "inspect_packet_capture" },
+  });
+  const admitted = await f.service.inspect({ ...request, packet_limit: 90 });
+  if (!admitted.ok) throw admitted.error;
+  const report = packetCaptureSchema.parse(admitted.value.normalized_result);
+  expect(report.output_window).toEqual({
+    matching_packets: 90,
+    returned_packets: 1,
+    has_more: true,
+  });
+  expect(report.packets[0]?.["frame.number"]).toEqual(["1"]);
+});
+
 it("returns canonical alias output through the public packet-capture CLI", async () => {
   const f = await fixture("alias-canonical");
   const cli = Cli.create("capture-alias-test", { sync: false });
@@ -205,9 +283,12 @@ it("returns canonical alias output through the public packet-capture CLI", async
     ],
     { stdout: (text) => (stdout += text), exit: () => {} },
   );
-  const result: unknown = JSON.parse(stdout);
-  expect(JSON.stringify(result)).toContain('"bootp.type"');
-  expect(JSON.stringify(result)).toContain('"dhcp.type":["1"]');
+  const evidence = parseEvidence(JSON.parse(stdout));
+  const report = packetCaptureSchema.parse(evidence.normalized_result);
+  expect(report.selection.fields).toEqual(["bootp.type"]);
+  expect(report.packets).toEqual([
+    { "frame.number": ["1"], "dhcp.type": ["1"] },
+  ]);
 });
 
 it("bounds admission without queuing additional snapshots or delaying cancellation", async () => {
@@ -634,8 +715,14 @@ it("discovers installed protocols and field definitions without a capture", asyn
       {
         records: [
           {
+            kind: "field",
+            name: "Other Vendor",
             abbreviation: "usb.idVendor",
             field_type: "FT_UINT32",
+            parent_protocol: "usb",
+            display_base: "BASE_HEX",
+            bitmask: "0x0",
+            description: "Second registration",
             source_line: 3,
           },
         ],
@@ -744,7 +831,7 @@ it.each([
       retryable: false,
     });
     expect(analysisErrorRemediationAction(result.error)).toContain(
-      "The retained command-output allowance",
+      "producer_limits.output_bytes",
     );
     expect(analysisErrorRemediationAction(result.error)).not.toMatch(
       /Review the reported worker memory limits/u,

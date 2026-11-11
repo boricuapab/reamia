@@ -311,6 +311,10 @@ describe("JavaScript export return-shape pairing limits", () => {
         label,
       ).toBe(true);
       expect(
+        result.property_inventories.map(({ side }) => side).sort(),
+        label,
+      ).toEqual(["left", "right"]);
+      expect(
         result.property_inventories.every(
           ({ paired, discriminant }) => !paired && discriminant === null,
         ),
@@ -629,6 +633,10 @@ describe("JavaScript export matching uncertain projections", () => {
         'export default () => ({ kind: "record", tokens: [{ extra: 1 }] });',
     });
     const result = compare(...graphs);
+    expect(result.property_inventories.map(({ side }) => side).sort()).toEqual([
+      "left",
+      "right",
+    ]);
     expect(result.summary).toMatchObject({ added: 0, removed: 0, changed: 0 });
     expect(result.coverage.status).toBe("partial");
     for (const inventory of result.property_inventories)
@@ -645,6 +653,9 @@ describe("JavaScript export matching uncertain projections", () => {
       }`;
       const graphs = await analyzeSources({ left: source, right: source });
       const result = compare(...graphs);
+      expect(
+        result.property_inventories.map(({ side }) => side).sort(),
+      ).toEqual(["left", "right"]);
       expect(result.changes).toEqual([]);
       expect(result.summary).toEqual({
         added: 0,
@@ -1184,6 +1195,25 @@ describe("JavaScript export return-shape projection", () => {
     expect(result.coverage.status).toBe("complete-within-inputs");
     expect(result.coverage.left_omitted_fields).toBe(0);
     expect(result.coverage.right_omitted_fields).toBe(0);
+    const paths = [
+      "/a_type",
+      ...Array.from({ length: 70 }, (_, i) => `/field${String(i)}`),
+    ].sort();
+    expect(result.property_inventories.map(({ side }) => side).sort()).toEqual([
+      "left",
+      "right",
+    ]);
+    for (const inventory of result.property_inventories) {
+      expect(inventory.paired).toBe(true);
+      expect([...inventory.properties].sort()).toEqual(paths);
+    }
+    expect(result.changes).toEqual([]);
+    expect(result.summary).toEqual({
+      added: 0,
+      removed: 0,
+      changed: 0,
+      unknown: 0,
+    });
   });
 });
 
