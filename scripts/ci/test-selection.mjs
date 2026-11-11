@@ -39,7 +39,9 @@ const full = (reason, changedPaths = []) => ({
 /** Plan an observational PR subset from the classifier's existing Git diff. */
 export function planTestSelection(files, event, tier) {
   if (event !== "pull_request" || tier !== "fast")
-    return full("Only ordinary PRs are candidates", files);
+    // Full runs do not use changed paths. Large upstream syncs can exceed the
+    // OS per-environment-variable limit when this plan reaches test-report.
+    return full("Only ordinary PRs are candidates");
   if (!files.length) return full("No changed paths available");
   const owners = new Set();
   const changedTests = [];

@@ -20,6 +20,26 @@ const evaluation = "tests/evaluation/testDiscovery.test.ts";
 
 const passed = (name: string) => ({ name, durationMs: 10, state: "passed" });
 
+it("keeps full-run report plans bounded after a large upstream sync", () => {
+  const paths = Array.from(
+    { length: 10_000 },
+    (_, index) => `src/synced/module-${index}.ts`,
+  );
+  for (const [event, tier] of [
+    ["push", "fast"],
+    ["schedule", "full"],
+    ["pull_request", "full"],
+  ] as const) {
+    const plan = planTestSelection(paths, event, tier);
+    expect(Buffer.byteLength(JSON.stringify(plan))).toBeLessThan(1_024);
+    const inventory = [sqliteSource, cliBoundary];
+    const report = compareTestSelection(plan, inventory, inventory.map(passed));
+    expect(report.selected).toEqual(inventory.toSorted());
+    expect(report.omitted).toEqual([]);
+    expect(report.complete).toBe(true);
+  }
+});
+
 it("unions affected leaf owners, keeps changed tests and retains unowned integration tests", () => {
   const plan = planTestSelection(
     ["src/sqlite/SqliteDatabaseProvider.ts", adbBoundary],
