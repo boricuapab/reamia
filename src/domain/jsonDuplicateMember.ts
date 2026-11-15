@@ -41,20 +41,20 @@ export const findDuplicateJsonMember = (
       names.add(name);
       continue;
     }
-    switch (text[index]) {
-      case "{":
+    switch (code) {
+      case 0x7b: // {
         open.push(new Set());
         expectName = true;
         break;
-      case "[":
+      case 0x5b: // [
         open.push(null);
         break;
-      case "}":
-      case "]":
+      case 0x7d: // }
+      case 0x5d: // ]
         open.pop();
         expectName = false;
         break;
-      case ",":
+      case 0x2c: // ,
         expectName = open.at(-1) instanceof Set;
         break;
     }
