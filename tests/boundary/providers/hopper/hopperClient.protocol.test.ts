@@ -1,10 +1,11 @@
 import { once } from "node:events";
 
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
 import { HopperProcessError } from "../../../../src/domain/hopperErrors.js";
 import { HOPPER_OPERATIONS } from "../../../../src/hopper/HopperProviderMetadata.js";
 import { HopperClient } from "../../../../src/hopper/HopperClient.js";
+import { parseHopperReply } from "../../../../src/hopper/HopperReplyContracts.js";
 import type { HopperDiagnostic } from "../../../../src/hopper/HopperDiagnostics.js";
 import { providerCleanupFailure } from "../../../../src/hopper/HopperDiagnostics.js";
 import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
@@ -13,8 +14,29 @@ import {
   HopperFixtureLauncher as FixtureLauncher,
   startHopperFixtureClient as startClient,
 } from "./hopperClient.fixture.js";
+import { waitFor } from "../../../support/testWait.js";
 
 describe("HopperClient protocol", () => {
+  it("returns contract-valid fixture segments with explicit permission provenance", async () => {
+    const client = await startClient();
+    const reply = await client.callTool("list_segments", {});
+    if (!reply.ok) throw reply.error;
+    expect(parseHopperReply("list_segments", reply.value)).toMatchObject({
+      ok: true,
+      value: [
+        {
+          name: "__TEXT",
+          readable: null,
+          writable: null,
+          executable: null,
+          permissions: { available: false, reason: expect.any(String) },
+          provenance: "hopper-public-python-api",
+          sections: [],
+        },
+      ],
+    });
+  });
+
   it("does not start cold and preserves normal dispatch once ready", async () => {
     const launcher = new FixtureLauncher();
     const client = new HopperClient({ launcher, startupTimeoutMs: 1_000 });
@@ -82,7 +104,7 @@ describe("HopperClient protocol", () => {
     void fast.then(() => {
       fastSettled = true;
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(client.requestActivity()).toMatchObject({
         operation: "echo",
         queuedRequests: 1,
@@ -264,7 +286,7 @@ it("preserves caller cancellation while a late valid UTF-8 reply drains", async 
   expect(result.error.cause).toBe(reason);
   expect(client.requestActivity()).toMatchObject({ callerState: "cancelled" });
   await launcher.release(request);
-  await vi.waitFor(() => expect(client.requestActivity()).toBeNull());
+  await waitFor(() => expect(client.requestActivity()).toBeNull());
   await expect(
     client.callTool("echo", { label: "next �雪🦊" }),
   ).resolves.toEqual({

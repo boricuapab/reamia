@@ -3,6 +3,12 @@ import { dirname, join, posix, win32 } from "node:path";
 
 import { ConfigurationError } from "../domain/configurationErrors.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
+import {
+  absoluteXdgConfigHome,
+  vscodeUserDirectory,
+  type ClientRootContext,
+} from "./ClientConfigRoots.js";
+import { windowsAppDataRoots } from "./MsixPackageStorage.js";
 import type { SetupClient, SupportedClientName } from "./SupportedClients.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import type { ClientConfigurationDocument } from "./ClientConfigurationDocument.js";
@@ -64,17 +70,20 @@ export const fromSetup =
     };
   };
 
-export const platformPaths = (context: McpRegistrationLocationContext) => {
-  const { home, platform, environment } = context;
-  const config = environment.XDG_CONFIG_HOME || join(home, ".config");
-  const appSupport =
-    platform === "win32"
-      ? environment.APPDATA || win32.join(home, "AppData", "Roaming")
-      : platform === "darwin"
-        ? join(home, "Library", "Application Support")
-        : config;
-  return { config, appSupport, vscode: join(appSupport, "Code", "User") };
-};
+/** The client-root context of one registration selection. */
+export const rootContext = ({
+  home,
+  platform,
+  environment,
+}: McpRegistrationLocationContext): ClientRootContext => ({
+  home,
+  platform,
+  env: environment,
+});
+
+/** Windows roaming application data, read as setup reads it. */
+const windowsRoaming = (context: McpRegistrationLocationContext): string =>
+  windowsAppDataRoots(context.home, context.environment).roaming;
 
 const location = (
   path: string,
@@ -112,63 +121,13 @@ export const clineLocation = async (
 ): Promise<McpRegistrationGlobalLocation> =>
   location(
     join(
-      platformPaths(context).vscode,
+      vscodeUserDirectory(rootContext(context)),
       "globalStorage",
       "saoudrizwan.claude-dev",
       "settings",
       "cline_mcp_settings.json",
     ),
   );
-export const clineCliLocation = async (
-  context: McpRegistrationLocationContext,
-): Promise<McpRegistrationGlobalLocation> => {
-  const { environment, home } = context;
-  const explicitPath = environment.CLINE_MCP_SETTINGS_PATH?.trim();
-  if (explicitPath) return location(explicitPath);
-  const explicitData = environment.CLINE_DATA_DIR?.trim();
-  if (explicitData)
-    return location(join(explicitData, "settings", "cline_mcp_settings.json"));
-  const explicitDirectory = environment.CLINE_DIR?.trim();
-  if (explicitDirectory)
-    return location(
-      join(explicitDirectory, "data", "settings", "cline_mcp_settings.json"),
-    );
-  const envHome = environment.HOME?.trim();
-  const profile = environment.USERPROFILE?.trim();
-  const drive = environment.HOMEDRIVE?.trim();
-  const path = environment.HOMEPATH?.trim();
-  // Cline falls back to os.homedir(), then to the literal "~". On POSIX,
-  // a present HOME is returned by os.homedir() even if empty or "~".
-  // Otherwise use the supplied account home only when it was not selected
-  // from a rejected environment value; that value cannot prove the OS home.
-  const rejectedHome =
-    context.platform !== "win32" && environment.HOME !== undefined;
-  const fallbackUncertain =
-    (context.platform === "win32" &&
-      (environment.USERPROFILE !== undefined ||
-        Boolean(environment.HOMEDRIVE && environment.HOMEPATH) ||
-        Boolean(environment.HOME))) ||
-    (context.platform !== "win32" &&
-      environment.HOME === undefined &&
-      environment.USERPROFILE !== undefined);
-  const nativeHome = rejectedHome
-    ? "~"
-    : fallbackUncertain
-      ? undefined
-      : home.trim() || "~";
-  const clineHome =
-    (envHome && envHome !== "~" ? envHome : undefined) ||
-    profile ||
-    (drive && path ? `${drive}${path}` : undefined) ||
-    nativeHome;
-  if (!clineHome)
-    throw new ConfigurationError(
-      "Cannot determine Cline CLI's system home from the selected environment. Set CLINE_MCP_SETTINGS_PATH, CLINE_DATA_DIR, or CLINE_DIR to select its configuration location.",
-    );
-  return location(
-    join(clineHome, ".cline", "data", "settings", "cline_mcp_settings.json"),
-  );
-};
 export const gooseLocation = async (
   context: McpRegistrationLocationContext,
 ): Promise<McpRegistrationGlobalLocation> => {
@@ -179,18 +138,12 @@ export const gooseLocation = async (
     const selected = pathApi.join(root, "config", "config.yaml");
     return location(selected, selected);
   }
-  const xdg = environment.XDG_CONFIG_HOME;
+  // etcetera's Windows and XDG strategies; only an absolute XDG root counts.
   const path =
     platform === "win32"
-      ? join(
-          platformPaths(context).appSupport,
-          "Block",
-          "goose",
-          "config",
-          "config.yaml",
-        )
+      ? join(windowsRoaming(context), "Block", "goose", "config", "config.yaml")
       : join(
-          xdg && posix.isAbsolute(xdg) ? xdg : join(home, ".config"),
+          absoluteXdgConfigHome({ home, env: environment }),
           "goose",
           "config.yaml",
         );
@@ -236,14 +189,22 @@ export const mcporterLocation = async (
 export const zedLocation = async (
   context: McpRegistrationLocationContext,
 ): Promise<McpRegistrationGlobalLocation> =>
+  // Zed's paths::config_dir. On Windows it reads the RoamingAppData known
+  // folder, which APPDATA normally names; on Linux, `dirs::config_dir`
+  // admits only an absolute XDG_CONFIG_HOME.
   location(
     context.platform === "darwin"
       ? join(context.home, ".config", "zed", "settings.json")
-      : join(
-          platformPaths(context).appSupport,
-          context.platform === "win32" ? "Zed" : "zed",
-          "settings.json",
-        ),
+      : context.platform === "win32"
+        ? join(windowsRoaming(context), "Zed", "settings.json")
+        : join(
+            absoluteXdgConfigHome({
+              home: context.home,
+              env: context.environment,
+            }),
+            "zed",
+            "settings.json",
+          ),
   );
 
 export const fxLocation = async (

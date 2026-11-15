@@ -1944,9 +1944,9 @@ const noteScriptReference = (
 const noteScriptTarget = (state: ScanState, location: string): void => {
   const target = memberLocationKey(state, location);
   const spellings = state.scriptTargets.get(target);
-  retractLinkerMapGuesses(state, location);
   const spelling = anchoredLocation(state, location);
   if (spellings?.has(spelling)) return;
+  retractLinkerMapGuesses(state, location);
   state.scriptTargetBytes += Buffer.byteLength(spelling);
   if (state.scriptTargetBytes > MAX_RELEASE_EXPOSURE_SCRIPT_TARGET_BYTES) {
     state.skippedMaps += 1;
@@ -2058,11 +2058,17 @@ const noteLocalMapReference = (
  */
 const noteMapTarget = (state: ScanState, location: string): void => {
   const target = memberLocationKey(state, location);
-  // A map read before its declaration may have settled as a linker map.
-  state.skippedMaps += retractLinkerMapGuesses(state, location);
   const spellings = state.mapTargets.get(target);
   const spelling = anchoredLocation(state, location);
   if (spellings?.has(spelling)) return;
+  // A late declaration can identify an exact occurrence already examined as
+  // a linker-map candidate. Claim that identity before final target coverage
+  // considers other spellings in the normalized bucket.
+  if (state.examinedMembers.get(target)?.has(spelling) === true)
+    state.claimedMapTargets.add(target);
+  // Retract once per exact declaration; repeating it must not consume peers
+  // that only share its normalized lookup key.
+  state.skippedMaps += retractLinkerMapGuesses(state, location);
   state.mapTargetBytes += Buffer.byteLength(spelling);
   if (state.mapTargetBytes > MAX_RELEASE_EXPOSURE_MAP_TARGET_BYTES) {
     state.skippedMaps += 1;
@@ -2545,7 +2551,7 @@ const embeddedPackageFormat = async (
   nativeFormat: NativeFormat,
   state: ScanState,
   context: ScanContext,
-  location = filePath,
+  location: string,
   expectedSha256?: string,
 ): Promise<EmbeddedPackageProbe> => {
   try {
@@ -2663,10 +2669,14 @@ const probePackagedImage = async (
   nativeFormat: NativeFormat,
   context: ScanContext,
 ): Promise<void> => {
+  const bytesReadBefore = state.memberBytesRead;
   const allowance = context.maxFileBytes - state.packagedProbeBytes;
   const image = allowance > 0 ? await member.read(allowance) : null;
   if (image?.kind !== "bytes") {
-    state.packagedProbeBytes = context.maxFileBytes;
+    state.packagedProbeBytes += Math.min(
+      Math.max(allowance, 0),
+      state.memberBytesRead - bytesReadBefore,
+    );
     state.unprobedImages += 1;
     noteUnexaminedPackage(state);
     pushLimitation(
@@ -2970,7 +2980,7 @@ const containerEntries = async (
   const traversal = new ArtifactTraversalObservation();
   let count = 0;
   let truncated = false;
-  for await (const entry of container.reader.entries(signal, traversal)) {
+  for await (const entry of traversal.entries(container.reader, signal)) {
     count += 1;
     if (count > CONTAINER_LIST_LIMIT) {
       if (!truncated) {
@@ -3100,19 +3110,29 @@ const readSpan = async (
             `Artifact changed before read: ${filePath}`,
           );
         if (offset + length > observed.size) return null;
-        const bytes = await readFileHandleRange(handle, offset, length, () => {
-          if (signal?.aborted)
-            throw new AnalysisCancelledError(OPERATION, {
-              cause: signal.reason,
-            });
-        });
+        // Charge bytes as they arrive, so a read that fails after partial
+        // progress still counts what it consumed against the allowance.
+        let charged = 0;
+        const bytes = await readFileHandleRange(
+          handle,
+          offset,
+          length,
+          (bytesRead) => {
+            state.memberBytesRead += bytesRead - charged;
+            charged = bytesRead;
+            if (signal?.aborted)
+              throw new AnalysisCancelledError(OPERATION, {
+                cause: signal.reason,
+              });
+          },
+        );
         const after = await handle.stat();
         if (!sameRegularFileState(initial, after))
           throw new ArtifactReaderFailure(
             "integrity",
             `Artifact changed during read: ${filePath}`,
           );
-        state.memberBytesRead += bytes.length;
+        state.memberBytesRead += bytes.length - charged;
         return Buffer.from(bytes);
       },
     );
